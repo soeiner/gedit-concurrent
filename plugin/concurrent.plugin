@@ -1,0 +1,8 @@
+[Plugin]
+Loader=python
+Module=concurrent_main
+IAge=3
+Name=Concurrent Modification
+Description=Edit files at the same time with ye mates
+Authors=Sven Langner
+Copyright=Copyright © 2016 Sven Langner
