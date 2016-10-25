@@ -32,9 +32,9 @@ class Server:
             changed_index = change_command["index"]
 
             current_rev_id = self.rev_counter
-            revs = current_rev_id - changed_rev_id
+            revs = current_rev_id - changed_rev_id  # revs = 1
             print("================")
-            for i in range(1, revs):
+            for i in range(1, revs + 1):
                 between_rev = self.revision_commands["rev" + str(changed_rev_id + i)]
                 print(between_rev)
                 if between_rev["action"] == "insert":
@@ -64,7 +64,8 @@ class Server:
             self.revision_commands["rev" + str(self.rev_counter)] = change_command
             self.content_revisions["rev" + str(self.rev_counter)] = self.content
             print("REVISION " + str(self.rev_counter))
-            print("\n\n")
+            print(revs)
+            print("\n")
         except Exception as exc:
             log(exc)
 

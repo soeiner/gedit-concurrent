@@ -86,7 +86,6 @@ class Logger:
                 'type': e_type.__name__,
                 'file': e_traceback.tb_frame.f_code.co_filename,
                 'line': e_traceback.tb_lineno,
-                'message': e_value.message,
                 'name': e_traceback.tb_frame.f_code.co_name,
             }
             del (e_type, e_value, e_traceback)

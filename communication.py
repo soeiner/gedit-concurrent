@@ -92,7 +92,7 @@ class SocketHelper:
 
     # receive from a socket as long as there is data to be received
     def read_(self, packet_size=4096, error_handling=True):
-        data = ''
+        data = b''
         try:
             while True:
                 (rlist, x, y) = select.select([self.socket], [], [], 0)
@@ -114,7 +114,7 @@ class SocketHelper:
                 return False
             else:
                 raise e
-        return data
+        return data.decode("utf-8")
 
     # puts send() and receive() cleanly together in one communication operation
     # try to use communicate() in every case, instead of send() + receive()
