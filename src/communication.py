@@ -1,11 +1,15 @@
-import socket
-import select
-import time
-import threading
 import json
+import select
+import socket
+import threading
+import time
 
-from logging_ import Logger, log
 from notifier import Notifier
+
+from src.logging_ import Logger, log
+
+
+def none_function(*args, **kw): pass
 
 
 # library classes >>>>>>>>>
@@ -82,10 +86,15 @@ class SocketHelper:
 
         self.responsive = True
         self.unresponsive_times = 0
+        self.waiting = False
 
         self.last_send_time = 0
 
         # self.server.logger..log("%s created."%self.prefix)
+
+    def __del__(self):
+        self.stop_waiting_for_data()
+        self.socket.close()
 
     def log(self, s):
         log(s, prefix=self.prefix)
@@ -160,7 +169,8 @@ class SocketHelper:
             self.logger.log("[SocketHelper.wait_for_data] " + str(e))
             pass
         connected = True
-        while connected:
+        self.waiting = True
+        while connected and self.waiting:
             self.lock.acquire()
             rlist = []
             try:
@@ -175,7 +185,10 @@ class SocketHelper:
                     data = self.receive(locked=False)
                     if data and on_receive:
                         response = on_receive(data)
-                        if response:
+                        if isinstance(response, bool):
+                            answer = {"type": "_" + data["type"] + "_", "success": response}
+                            self.send(answer, locked=False, await_response=False)
+                        elif response:
                             self.send(response, locked=False, await_response=False)
                 except Exception as e:  # --> socket has been closed --> break
                     self.on_close_notifier.notify()
@@ -183,6 +196,10 @@ class SocketHelper:
                     self.log(e)
                     connected = False
             self.lock.release()
+        self.waiting = False
+
+    def stop_waiting_for_data(self):
+        self.waiting = False
 
     # Returns True if there is callback data, False if there isn't.
     # throws error if disconnected

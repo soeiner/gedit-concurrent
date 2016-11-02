@@ -1,7 +1,8 @@
-import threading
 import sys
+import threading
 import time
-from notifier import Notifier
+
+from src.notifier import Notifier
 
 g_log_file = None
 g_logger_content = ""
