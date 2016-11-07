@@ -3,10 +3,11 @@ import select
 import socket
 import threading
 import time
+from abc import abstractmethod
 
 from notifier import Notifier
 
-from src.logging_ import Logger, log
+from logging_ import log, default_logger
 
 
 def none_function(*args, **kw): pass
@@ -34,6 +35,9 @@ class TCPServerSocket:
 
         self.clients = []
 
+    def __log(self, s):
+        log(s, prefix="Server Socket")
+
     # wait for incoming connections on the server socket
     # and accept them if accept_new == True
     def wait_for_connection(self):
@@ -41,15 +45,15 @@ class TCPServerSocket:
             x, y, z = select.select([self.socket], [], [], 1)
             if len(x) > 0 and self.accept_new:
                 peer_socket, (host, port) = self.socket.accept()
-                print("Connection to %s:%s successful!" % (host, port))
-                peer_socket_helper = SocketHelper(peer_socket)
+                self.__log("Connection to %s:%s successful!" % (host, port))
+                peer_socket_wrapper = JSONSocketWrapper(peer_socket)
 
                 def disconnect_socket_helper():
-                    self.clients.remove(peer_socket_helper)
+                    self.clients.remove(peer_socket_wrapper)
 
-                peer_socket_helper.on_close_notifier.add_observer(disconnect_socket_helper)
-                self.clients.append(peer_socket_helper)
-                self.on_connect(peer_socket, host)
+                peer_socket_wrapper.on_close_notifier.add_observer(disconnect_socket_helper)
+                self.clients.append(peer_socket_wrapper)
+                self.on_connect(peer_socket_wrapper, peer_socket, host)
 
     # stop running and close socket
     def stop(self):
@@ -57,7 +61,7 @@ class TCPServerSocket:
         self.listener_thread.join()
         self.socket.close()
         for client in self.clients:
-            client.socket.close()
+            client.stop_listening()
         return True
 
     # define if the server should accept incoming connections or let them wait
@@ -65,280 +69,252 @@ class TCPServerSocket:
         self.accept_new = True
 
 
-# manages error handling, logging and lock for a socket
-# can be used on both master and slave ends of a socket
-class SocketHelper:
-    def __init__(self, socket, retry_count=0, prefix="SocketHelper", logger=None, max_select_timeout=5):
-        if logger is None:
-            self.logger = Logger()
-        else:
-            self.logger = logger
-            # self.server.logger. = logger
-        self.prefix = prefix  # Logging prefix for console output
-        self.retry_count = retry_count  # sending retry count
-        self.socket = socket
-        self.socket.setblocking(False)  # socket.send() and socket.recv() don't block but throw an error or return False
-        self.lock = threading.Lock()
-        self.default_select_timeout = self.max_select_timeout = max_select_timeout
+class SocketWrapper:
+    def __init__(self, sock, prefix="SocketWrapper", start_listening=True):
+        self.__prefix = prefix
+        self.__socket = sock
+        # socket.send() and socket.recv() don't block but throw an error or return False
+        self.__socket.setblocking(False)
+        self.__running = False
+        self.__locks = {}
 
         self.on_close_notifier = Notifier()
-        self.unresponsive_notifier = Notifier()
 
-        self.responsive = True
-        self.unresponsive_times = 0
-        self.waiting = False
+        if start_listening:
+            self.start_listening()
 
-        self.last_send_time = 0
-
-        # self.server.logger..log("%s created."%self.prefix)
+    def close_socket(self):
+        self.on_close_notifier.notify()
+        self.__socket.close()
 
     def __del__(self):
-        self.stop_waiting_for_data()
-        self.socket.close()
+        self.stop_listening()
+        self.close_socket()
 
-    def log(self, s):
-        log(s, prefix=self.prefix)
+    def _log(self, s):
+        log(s, prefix=self.__prefix)
+
+    def start_listening(self):
+        self.__running = True
+        threading.Thread(target=self._wait_for_data).start()
+
+    def stop_listening(self):
+        self.__running = False
+
+    def unlock_key(self, key: str):
+        try:
+            self.__locks[key].release()
+        except AttributeError as e:
+            self._log("No such lock: " + str(key))
+            self._log(e)
+        except Exception as e:
+            self._log(e)
+
+    # Returns True if there is callback data, False if there isn't.
+    # throws error if disconnected
+    # set timeout if it differs from std timeout max_wait_timeout
+    # locked=False: do not acquire lock and do not release lock
+    def _send(self, data: bytes, lock_key: str = None, error_handling: bool = True):
+        if lock_key:
+            if lock_key not in self.__locks:
+                self.__locks[lock_key] = threading.Lock()
+            self.__locks[lock_key].acquire()
+        try:
+            self.__socket.send(data)
+            self.last_send_time = time.time()
+            # self.server.logger..log('Answered to %s%s' % (self.prefix,json))
+        except Exception as e:
+            self._log(e)
+            if not error_handling:
+                raise Exception("Error sending json: %s" % str(e))  # used to break the infinite wait_for_data loop
+        '''
+        try:
+            if lock_key:
+                self.__locks[lock_key].release()
+        except Exception as e2:
+            self._log(e2)
+            if not error_handling:
+                raise Exception(
+                    "Error sending json (lock release): %s" % str(e2))  # used to break the infinite wait_for_data loop
+        '''
 
     # receive from a socket as long as there is data to be received
-    def read_(self, packet_size=4096, error_handling=True):
+    def _receive(self, packet_size=4096, error_handling=True):
         data = b''
         try:
             while True:
-                (rlist, x, y) = select.select([self.socket], [], [], 0)
+                (rlist, x, y) = select.select([self.__socket], [], [], 0)
                 if len(rlist) > 0:
-                    chunk = self.socket.recv(packet_size)
+                    chunk = self.__socket.recv(packet_size)
                     if not chunk:
-                        self.log("socket.recv is None or False")
-                        self.on_close_notifier.notify()
-                        self.socket.close()
+                        self._log("socket.recv is None or False")
+                        self.close_socket()
                         break
                     data += chunk
                 else:
                     # select poll doesn't find anything --> no more data left on socket
                     break
         except Exception as e:
-            self.log("read_ error")
-            self.log(e)
-            if error_handling:
-                return False
-            else:
+            self._log(e)
+            if not error_handling:
                 raise e
-        return data.decode("utf-8")
-
-    # puts send() and receive() cleanly together in one communication operation
-    # try to use communicate() in every case, instead of send() + receive()
-    # Sends json to the peer, returns received data or True or False
-    # response timeout in seconds, default:self.max_wait_timeout
-    def communicate(self, json_string, timeout=None):
-        for i in range(self.retry_count + 1):
-            try:
-                send_successful = self.send(json_string, tmt=timeout)
-            except Exception as e:
-                self.log(e)
-                self.log("apparently DISCONNECTED")
-                self.on_close_notifier.notify()
-                send_successful = False
-            if send_successful:
-                cb = self.process_callback(self.receive())
-                if cb:
-                    # the client regains responsivity when it responses one time after not responding for many times
-                    self.unresponsive_times = 0
-                    self.responsive = True
-                    self.max_select_timeout = self.default_select_timeout
-                    return cb
-            else:
-                self.log(" did not respond at: " + str(json_string))
-                if self.responsive:
-                    self.unresponsive_times += 1
-                    # means that the client did not response at 3 different commands --> unresponsive
-                    if self.unresponsive_times > (2.5 * self.retry_count):
-                        self.responsive = False
-                        self.log(" unresponsive!!!")
-                        self.unresponsive_notifier.notify()
-                else:
-                    return False
-        return False
-
-    # infinite loop listening on the socket via select
-    # on_receive: handler function, must accept json data
-    def wait_for_data(self, on_receive):
-        self.log("Waiting for data...")
-        try:
-            self.lock.release()
-        except Exception as e:
-            self.logger.log("[SocketHelper.wait_for_data] " + str(e))
-            pass
-        connected = True
-        self.waiting = True
-        while connected and self.waiting:
-            self.lock.acquire()
-            rlist = []
-            try:
-                (rlist, x, y) = select.select([self.socket], [], [], 15)
-            except Exception as e:
-                self.log(e)
-                self.log("Stopping wait_for_data() due to error")
-                connected = False
-                self.on_close_notifier.notify()
-            if len(rlist) > 0:
-                try:
-                    data = self.receive(locked=False)
-                    if data and on_receive:
-                        response = on_receive(data)
-                        if isinstance(response, bool):
-                            answer = {"type": "_" + data["type"] + "_", "success": response}
-                            self.send(answer, locked=False, await_response=False)
-                        elif response:
-                            self.send(response, locked=False, await_response=False)
-                except Exception as e:  # --> socket has been closed --> break
-                    self.on_close_notifier.notify()
-                    self.log("Stopping wait_for_data() due to error 2")
-                    self.log(e)
-                    connected = False
-            self.lock.release()
-        self.waiting = False
-
-    def stop_waiting_for_data(self):
-        self.waiting = False
-
-    # Returns True if there is callback data, False if there isn't.
-    # throws error if disconnected
-    # set timeout if it differs from std timeout max_wait_timeout
-    # locked=False: do not acquire lock and do not release lock
-    def send(self, json, tmt=None, locked=True, await_response=True):
-        if locked:
-            self.lock.acquire()
-        self.read_()  # clear socket
-        try:
-            self.socket.send(json)
-            self.last_send_time = time.time()
-            # self.server.logger..log('Answered to %s%s' % (self.prefix,json))
-        except Exception as e:
-            self.log(e)
-            try:
-                if locked:
-                    self.lock.release()
-            except Exception as e2:
-                self.log(e2)
-            raise Exception("Error sending json: %s" % str(e))  # used to break the infinite wait_for_data loop
-        if await_response:
-            # wait for callback info, tmt seconds
-            if not tmt:
-                tmt = self.max_select_timeout
-            (sread, x, y) = select.select([self.socket], [], [], tmt)
-            if len(sread) > 0:
-                # self.server.logger..log('%sresponses...' % self.prefix)
-                # received callback from the client. NOT releasing lock, maybe data must be received first
-                return True
-            else:
-                self.log('%s Timeout expired, did not response...' % self.prefix)
-                # received no callback info after self.max_wait_timeout seconds
-                try:
-                    if locked:
-                        self.lock.release()
-                except Exception as e:
-                    self.logger.log(e)
-                    pass
-                return False
-        else:
-            return True
-
-    # used in combination with self.send() and self.process_callback(), receives everything and decodes it
-    # returns True, False or data
-    # locked=False: do not release lock
-    def receive(self, locked=True):
-        def eliminate_pings(json_):
-            while True:
-                if "}PING" in json_:
-                    self.send("PONG", locked=False, await_response=False)
-                    self.logger.log("----- received PING ------")
-                    json_ = json_.replace("}PING", "}")
-                if "PING{" in json_:
-                    self.send("PONG", locked=False, await_response=False)
-                    self.logger.log("----- received PING ------")
-                    json_ = json_.replace("PING{", "{")
-                else:
-                    break
-            return json_
-
-        def cut_last_message(json_):
-            if isinstance(json_, str) and "}{" in json_:
-                self.log("FATAL FATAL FATAL FATAL FATAL FATAL FATAL FATAL FATAL")
-                self.log("}{ was found in json_, which means that we tried sending"
-                         " two commands too close to each other (locking failure).")
-                while True:
-                    self.logger.log("while in decode_json")
-                    index = json_.find("}{")
-                    if index > -1:
-                        # json__ = json_[:(index + 1)]
-                        # cb = self.process_callback(json__)
-                        json_ = json_[(index + 1):]
-                    else:
-                        # cb = self.process_callback(json_)
-                        break
-            return json_
-
-        decoding = True
-        data = None
-        j = ""
-        while decoding:
-            select.select([self.socket], [], [], 1)
-            chunk = self.read_()
-            if chunk:
-                j += chunk
-            else:
-                self.log("empty chunk --> break while")
-                decoding = False
-            if '"' not in j:
-                j.replace("'", '"')
-            if len(j) > 0:
-                try:
-                    data = json.loads(j)
-                    decoding = False
-                except Exception as e:
-                    self.log("JSON not yet decodable")
-                    j = eliminate_pings(j)
-                    self.log(e)
-                    try:
-                        j = cut_last_message(j)
-                    except Exception as e:
-                        self.log("Error '}{' in recv_from_client, cut_last_message")
-                        self.log(e)
-                        decoding = False
-        if locked:
-            # Releasing lock, got all the data, just processing it from now on
-            try:
-                self.lock.release()
-            except Exception as e:
-                log("release lock in socket_helper.receive() error")
-                log(e)
-                pass
         return data
 
-    def process_callback(self, info):
-        try:
-            # process callback info
-            type_ = info[u'type']
-            if type_ == u'callb':
-                callb = info[u'callb'][u'value']
-                # self.server.logger..log('%sresponded: %s' % (self.prefix, callb))
-                if callb == u'ok':
-                    return True
-                else:
-                    return False
-            if type_ == u'data':
-                data = info[u'data'][u'value']
-                # self.server.logger..log('%sresponded: %s' % (self.prefix, data))
-                return data
-            if type_ == u'error':
-                c = info[u'error'][u'code']
-                print("Error Code " + c)
-                return False
-                # add other callback types to be processed here
-        except Exception as e:
-            self.logger.log(e)
-            # self.server.logger..log(self.prefix + "(communication.receive) Error processing callback: " + str(e))
-            pass
+    def _wait_for_data(self):
+        self._log("Waiting for data...")
+        connected = True
+        while connected and self.__running:
+            read_list = []
+            try:
+                (read_list, x, y) = select.select([self.__socket], [], [], 15)
+            except Exception as e:
+                self._log(e)
+                self._log("Stopping wait_for_data() due to error")
+                connected = False
+                self.close_socket()
+            if len(read_list) > 0:
+                try:
+                    data = self._receive(error_handling=False)
+                    if data:
+                        self._handle_data(data)
+                except Exception as e:  # socket has been closed
+                    self._log("Stopping wait_for_data()... has the socket been closed?")
+                    self._log(e)
+                    connected = False
+                    self.close_socket()
+        self.__running = False
 
-        # Return False, not able to handle the data that was returned by the peer socket
-        return False
+    @abstractmethod
+    def _handle_data(self, data: bytes):
+        pass
+
+
+class JSONSocketWrapper(SocketWrapper):
+    def __init__(self, sock, prefix="JSONSocketWrapper"):
+        super().__init__(sock, prefix=prefix)
+        self.__json_stream = bytes()
+        self.__data_handling_lock = threading.Lock()
+
+        # is only called if the command is a response
+        self.response_notifier = Notifier()
+        # is only called if the command is not a response
+        self.new_command_notifier = Notifier()
+
+    def _handle_data(self, data: bytes):
+        try:
+            def eliminate_pings(json_):
+                while True:
+                    if "}PING" in json_:
+                        self._send(bytes("PONG"))
+                        self._log("----- received PING ------")
+                        json_ = json_.replace("}PING", "}")
+                    elif "PING{" in json_:
+                        self._send(bytes("PONG"))
+                        self._log("----- received PING ------")
+                        json_ = json_.replace("PING{", "{")
+                    else:
+                        break
+                return json_
+
+            with self.__data_handling_lock:
+                self.__json_stream += data
+                json_stream_string = self.__json_stream.decode()
+                json_stream_string = eliminate_pings(json_stream_string)
+                index = json_stream_string.find("}{")
+                if index >= 0:
+                    json_package = json_stream_string[:(index + 1)]
+                else:
+                    json_package = json_stream_string
+                try:
+                    json_data = json.loads(str(json_package))
+                    if index > -1:
+                        self.__json_stream = self.__json_stream[(index + 1):]
+                    else:
+                        self.__json_stream = bytes()
+                    command_type = json_data["type"]
+                    if command_type[0] == "_" and command_type[-1] == "_":
+                        self.response_notifier.notify(event_data=json_data)
+                    else:
+                        self.new_command_notifier.notify(event_data=json_data)
+                except json.JSONDecodeError as e:
+                    self._log("Warning: JSON could not be decoded yet.")
+                    self._log(e)
+                    self._log(self.__json_stream)
+        except Exception as e:
+            self._log(e)
+            self._log("FATAL EXCEPTION IN _handle_data()")
+            raise e
+
+    def _wait_for_response(self, command_type: str, timeout: int = None):
+        end_time = (time.time() + timeout) if timeout is not None else None
+        response = None
+        while True:
+            json_command = self.response_notifier.wait(timeout=timeout)
+            if "type" in json_command and json_command["type"] == "_" + command_type + "_":
+                response = json_command
+                break
+            else:
+                if end_time is not None and time.time() > end_time:
+                    break
+                time.sleep(0.01)
+        return response
+
+    def __json_to_bytes(self, json_command: dict):
+        return json.dumps(json_command).encode("utf-8")
+
+    def communicate_json(self, json_command: dict, lock_key: str = None, timeout: int = None):
+        if lock_key is None:
+            lock_key = json_command["type"]
+        data = self.__json_to_bytes(json_command)
+        self._send(data, lock_key=lock_key)
+        self._log("sent data")
+        response = self._wait_for_response(json_command["type"], timeout=timeout)
+        self._log("end wait for response")
+        self.unlock_key(lock_key)
+        return response
+
+    def push_json(self, json_response: dict):
+        data = self.__json_to_bytes(json_response)
+        self._send(data)
+
+
+# a small library test
+if __name__ == "__main__":
+    server_wrapper = None
+
+    global default_logger
+    default_logger.ptc = True
+
+
+    def on_command_server_side(cmd: dict):
+        global server_wrapper
+        cmd["type"] = "_" + cmd["type"] + "_"
+        time.sleep(1)
+        server_wrapper.push_json(cmd)
+
+
+    def on_connect(wrapper: JSONSocketWrapper, s, h):
+        global server_wrapper
+        wrapper.new_command_notifier.add_observer(on_command_server_side)
+        server_wrapper = wrapper
+
+
+    def do_client_command(json_data, delay):
+        time.sleep(delay)
+        print("Making command: " + str(json_data))
+        response = client.communicate_json(json_data)
+        print(json_data, " ---> ", response)
+
+
+    port = 12457
+
+    server = TCPServerSocket(port, on_connect)
+
+    client_socket = socket.socket()
+    client_socket.connect(("localhost", port))
+    client = JSONSocketWrapper(client_socket, prefix="Client")
+    threading.Thread(target=lambda: do_client_command({"type": "test"}, 0)).start()
+    threading.Thread(target=lambda: do_client_command({"type": "test2", "add": "test"}, 0.5)).start()
+    time.sleep(10)
+    client.stop_listening()
+    server.stop()
